@@ -22,17 +22,18 @@ databytes(info::TDMSInfo) = sum((ci.eltype === Nothing ? 0 : ci.nsamples * sizeo
     readtdms(fn; memory = Sys.free_memory()) -> File
 
 Read the whole file into memory. `memory` is the byte budget the channel data
-may occupy; a file whose data exceeds it is refused with a pointer to
-`tdmsblocks` / `tdmsread`, which read on demand, rather than being swapped in.
+may occupy. It is checked segment by segment, before each segment's data is
+read, so a file that would exceed it is refused -- with a pointer to
+`tdmsblocks` / `tdmsread`, which read on demand -- at the point it would go
+over, never after; there is no separate metadata pass, so the check costs nothing
+on files that fit.
 """
 function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
-    need = databytes(tdmsinfo(fn))
-    need <= memory || error("readtdms: $(repr(basename(fn))) holds $need bytes of channel data, over the " *
-                            "$memory-byte budget (memory=); read it on demand with tdmsblocks or tdmsread instead")
     s = open(fn)
     f=File()
     objdict=ObjDict()
     fsize = filesize(fn)
+    loaded = 0
     while !eof(s)
         startpos = position(s)
         (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
@@ -48,6 +49,12 @@ function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
         datapos = startpos + 28 + Int64(rawdataoffset)
         segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
         if toc.kTocRawData
+            loaded += segend - datapos
+            if loaded > memory
+                close(s)
+                error("readtdms: $(repr(basename(fn))) holds more than $memory bytes of channel data " *
+                      "(memory=; $loaded bytes by byte $datapos); read it on demand with tdmsblocks or tdmsread instead")
+            end
             seek(s, datapos)
             readrawdata!(objdict, segend - datapos, toc.kTocInterleavedData, s)
         end
