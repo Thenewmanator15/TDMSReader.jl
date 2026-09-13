@@ -112,3 +112,27 @@ let fn=TDMSReader._example_incremental
 
     end
 end
+
+let dir=joinpath(@__DIR__, "example_files")
+    # Two channels written sample-interleaved (kTocInterleavedData set): rows of
+    # (ch1, ch2) = (1,-1), (2,-2), ... Reading them as two contiguous blocks
+    # gives each channel half of the other's samples.
+    @testset "Interleaved Channels" begin
+        a=TDMSReader.readtdms(joinpath(dir, "interleaved.tdms"))
+        @test a[1,"ch1"].data == Int16[1:8;]
+        @test a[1,"ch2"].data == -Int16[1:8;]
+    end
+
+    # A file LabVIEW never closed: the last segment's next-segment offset is all
+    # ones, its data runs to end of file, and the final chunk is partial (7 of the
+    # declared 12 values, then a stray byte that is not a whole Int16).
+    @testset "Never-Closed File" begin
+        a=TDMSReader.readtdms(joinpath(dir, "never_closed.tdms"))
+        @test a[1,"ch1"].data == Int16[1:19;]
+    end
+
+    # DAQmx raw data is not implemented; say so, rather than fail on an undefined variable
+    @testset "DAQmx Refused" begin
+        @test_throws ErrorException TDMSReader.readtdms(TDMSReader._example_DAQmx)
+    end
+end

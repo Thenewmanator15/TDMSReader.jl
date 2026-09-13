@@ -16,7 +16,9 @@ function readtdms(fn::AbstractString)
     s = open(fn)
     f=File()
     objdict=ObjDict()
+    fsize = filesize(fn)
     while !eof(s)
+        startpos = position(s)
         (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
         if toc.kTocNewObjList
             empty!(objdict.current)
@@ -24,9 +26,17 @@ function readtdms(fn::AbstractString)
         if toc.kTocMetaData
             readmetadata!(f, objdict, s)
         end
+        # A file that was never closed (LabVIEW crashed, power failed) carries an
+        # all-ones next-segment offset: its data runs to end of file, and the last
+        # chunk may be partial. Clamp to what the file actually holds.
+        datapos = startpos + 28 + Int64(rawdataoffset)
+        segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
         if toc.kTocRawData
-            readrawdata!(objdict, nextsegmentoffset-rawdataoffset, s)
+            seek(s, datapos)
+            readrawdata!(objdict, segend - datapos, toc.kTocInterleavedData, s)
         end
+        nextsegmentoffset == typemax(UInt64) && break
+        seek(s, segend)
     end
     close(s)
     f
@@ -183,20 +193,44 @@ function readrawdata!(objects::NTuple{N,Chunk}, nbytes::Integer, s::IO) where N
     return nothing
 end
 
-function readrawdata!(objdict::ObjDict, nbytes::Integer, s::IO)
-    n = 0
-    while n < nbytes && !eof(s)
-        for (key,val) in objdict.current
-            n += readchunk!(val.data, val.nsamples, s)
+"""
+Read `nbytes` of raw data for the channels in `objdict.current`, chunk after chunk.
+Contiguous layout: each chunk holds every channel's `nsamples` values one channel
+after another. Interleaved layout (`kTocInterleavedData`): each chunk holds
+`nsamples` rows of one value per channel. A final chunk that the file cuts short
+yields as many whole values as it holds, in layout order, and no more.
+"""
+function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::IO)
+    chans = collect(values(objdict.current))
+    isempty(chans) && return nothing
+    left = Int(nbytes)
+    if interleaved
+        rowbytes = sum(sizeof(eltype(c.data)) for c in chans)
+        while left >= rowbytes
+            for c in chans
+                push!(c.data, read(s, eltype(c.data)))
+            end
+            left -= rowbytes
+        end
+    else
+        while left > 0
+            before = left
+            for c in chans
+                left -= readchunk!(c.data, min(Int(c.nsamples), left ÷ sizeof(eltype(c.data))), s)
+                left > 0 || break
+            end
+            left < before || break        # only a fragment of a value remains
         end
     end
     return nothing
 end
 
+"Append `n` values of `T` to `v` in one read; returns the bytes consumed."
 function readchunk!(v::Vector{T}, n::Integer, s::IO) where {T}
-    for i = 1:n
-        push!(v, read(s,T))
-    end
+    n <= 0 && return 0
+    m = length(v)
+    resize!(v, m + n)
+    read!(s, view(v, m+1:m+n))
     n*sizeof(T)
 end
 
@@ -227,11 +261,8 @@ function readDAQmx(s::IO, id)
     @info "Raw byte offset = $rawbyteoffset"
     @info "Sample Format Bitmatp = $sampleformatbitmap"
     @info "Scale ID = $scaleid"
-
-    for i in 1:n
-
-    end
-
+    # Parsing stops here: the caller raises "Not Implemented". (An empty loop over an
+    # undefined `n` used to raise UndefVarError first, hiding that message.)
 end
 
 function hexstring(x::Integer)
