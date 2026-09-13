@@ -136,3 +136,115 @@ let dir=joinpath(@__DIR__, "example_files")
         @test_throws ErrorException TDMSReader.readtdms(TDMSReader._example_DAQmx)
     end
 end
+
+# ---------------------------------------------------------------------------
+# Streaming: tdmsinfo / tdmsread / tdmsblocks read the metadata once and the
+# samples on demand, so a file need never be held in memory whole. Every answer
+# must equal what readtdms returns for the same file.
+# ---------------------------------------------------------------------------
+let dir=joinpath(@__DIR__, "example_files")
+    # a single-channel Int16 file with several segments of awkward lengths (test-only encoder)
+    function writesegments(path, segs)
+        open(path, "w") do io
+            for (k, seg) in enumerate(segs)
+                m = IOBuffer()
+                write(m, UInt32(2))
+                for (p, n) in (("/", nothing), ("/'G'/'c'", length(seg)))
+                    write(m, UInt32(ncodeunits(p))); write(m, codeunits(p))
+                    if n === nothing; write(m, UInt32(0xFFFFFFFF))
+                    else write(m, UInt32(20)); write(m, UInt32(2)); write(m, UInt32(1)); write(m, UInt64(n)) end
+                    write(m, UInt32(0))
+                end
+                meta = take!(m); raw = reinterpret(UInt8, seg)
+                write(io, codeunits("TDSm")); write(io, UInt32(0x2 | 0x4 | 0x8)); write(io, UInt32(4713))
+                write(io, UInt64(length(meta) + length(raw))); write(io, UInt64(length(meta)))
+                write(io, meta); write(io, raw)
+            end
+        end
+        path
+    end
+    segs = [Int16.(rand(-300:300, n)) for n in (10_007, 3_331, 25_001, 999)]
+    truth = vcat(segs...)
+    big = writesegments(joinpath(mktempdir(), "segs.tdms"), segs)
+
+    @testset "tdmsinfo: metadata only" begin
+        i = tdmsinfo(TDMSReader._example_tdms)
+        a = readtdms(TDMSReader._example_tdms)
+        @test i.file.props == a.props && keys(i.file) == keys(a)
+        @test i.file["Group"].props == a["Group"].props
+        @test isempty(i.file["Group","Channel1"].data)             # nothing read
+        @test i["Group","Channel1"].nsamples == 0
+        j = tdmsinfo(big)
+        @test j["G","c"].nsamples == length(truth) && j["G","c"].eltype == Int16
+        @test j[1,1] === j["G","c"]
+        @test collect(keys(j)) == [("G","c")]
+        @test_throws KeyError j["G","nope"]
+    end
+
+    @testset "tdmsread: ranges by absolute sample index, any layout" begin
+        @test tdmsread(big, "G", "c", 1:5) == truth[1:5]
+        @test tdmsread(big, "G", "c", 10_001:10_020) == truth[10_001:10_020]      # segment 1 -> 2
+        @test tdmsread(big, "G", "c", 13_330:13_345) == truth[13_330:13_345]      # segment 2 -> 3
+        @test tdmsread(big, "G", "c", 1:length(truth)) == truth
+        @test tdmsread(big, "G", "c", length(truth):length(truth)) == truth[end:end]
+        @test isempty(tdmsread(big, "G", "c", 5:4))
+        # interleaved and never-closed files stream like any other
+        @test tdmsread(joinpath(dir, "interleaved.tdms"), "Group", "ch2", 3:6) == -Int16[3:6;]
+        @test tdmsread(joinpath(dir, "never_closed.tdms"), "Group", "ch1", 11:19) == Int16[11:19;]
+        # the incremental fixtures: every channel, whole, equals readtdms
+        for fn in TDMSReader._example_incremental
+            a = readtdms(fn)
+            for (g, grp) in a.groups, (c, ch) in grp.channels
+                n = tdmsinfo(fn)[g, c].nsamples
+                @test n == length(ch.data)
+                @test tdmsread(fn, g, c, 1:n) == ch.data
+            end
+        end
+        # an info object stands in for the path, and is not re-walked
+        j = tdmsinfo(big)
+        @test tdmsread(j, "G", "c", 1:5) == truth[1:5]
+    end
+
+    @testset "bounds are checked, never clipped" begin
+        n = length(truth)
+        @test_throws BoundsError tdmsread(big, "G", "c", 0:5)
+        @test_throws BoundsError tdmsread(big, "G", "c", n:n+1)
+        @test_throws BoundsError tdmsread(big, "G", "c", n+1:n+1)
+        @test_throws KeyError tdmsread(big, "G", "nope", 1:1)
+        # a never-closed file's count is what the file holds, and reads stop there
+        j = tdmsinfo(joinpath(dir, "never_closed.tdms"))
+        @test j["Group","ch1"].nsamples == 19
+        @test_throws BoundsError tdmsread(j, "Group", "ch1", 19:20)
+    end
+
+    @testset "tdmsblocks: one buffer, every sample once, in order" begin
+        got = Int16[]; offs = Int[]; sizes = Int[]
+        total = tdmsblocks(big, "G", "c"; blocksize = 4096) do x, off
+            push!(offs, off); push!(sizes, length(x)); append!(got, x)
+        end
+        @test total == length(truth) && got == truth
+        @test offs == 0:4096:(length(truth) - 1) && all(sizes[1:end-1] .== 4096)
+        @test sizes[end] == (length(truth) - 1) % 4096 + 1                      # short, never padded
+        il = Int16[]
+        tdmsblocks(joinpath(dir, "interleaved.tdms"), "Group", "ch1"; blocksize = 3) do x, _; append!(il, x); end
+        @test il == Int16[1:8;]
+        nc = Int16[]
+        tdmsblocks(joinpath(dir, "never_closed.tdms"), "Group", "ch1"; blocksize = 5) do x, _; append!(nc, x); end
+        @test nc == Int16[1:19;]
+        @test tdmsblocks((x, _) -> nothing, TDMSReader._example_tdms, "Group", "Channel1") == 0
+    end
+
+    @testset "memory bounds: a byte budget sizes the buffer, and readtdms refuses to exceed it" begin
+        sizes = Int[]
+        tdmsblocks(big, "G", "c"; memory = 1000) do x, _; push!(sizes, length(x)); end   # 1000 B / 2 B = 500
+        @test maximum(sizes) == 500 && sum(sizes) == length(truth)
+        @test_throws ArgumentError tdmsblocks((x, _) -> nothing, big, "G", "c"; memory = 1)   # not even one value
+        # the whole file's data is 2 x length(truth) bytes; a smaller budget is a refusal, not a crash
+        @test_throws ErrorException readtdms(big; memory = 2 * length(truth) - 1)
+        @test occursin("tdmsblocks", sprint(showerror, try readtdms(big; memory = 10) catch e; e end))
+        @test readtdms(big; memory = 2 * length(truth))["G", "c"].data == truth
+        # the default budget is free RAM: a small file always fits
+        @test readtdms(big)["G", "c"].data == truth
+        @test TDMSReader.databytes(tdmsinfo(big)) == 2 * length(truth)
+    end
+end
