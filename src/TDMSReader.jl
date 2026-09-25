@@ -94,9 +94,7 @@ function readmetadata!(f::File, objdict::ObjDict, s::IO)
 end
 
 function readobj!(f::File, objdict::ObjDict, s::IO)
-    b=UInt8[]
-    readbytes!(s, b, read(s, UInt32))
-    objpath = String(b); empty!(b)
+    objpath = String(read(s, read(s, UInt32)))
     # @info "Read @ position $(hexstring(position(s)))"
     rawdata=read(s, UInt32)
     hasrawdata=false
@@ -161,17 +159,15 @@ function readobj!(f::File, objdict::ObjDict, s::IO)
     end
 end
 
+# Strings are read with `read(s, n)`, which allocates n bytes: `readbytes!` into an
+# empty vector first grows it to 64 KiB, which cost that much per string in the meta data.
 function readprop!(props, s::IO)
-    b=UInt8[]
     n=read(s,UInt32)
     for i=1:n
-        readbytes!(s, b, read(s, UInt32))
-        propname = String(b); empty!(b)
+        propname = String(read(s, read(s, UInt32)))
         T = tdsTypes[read(s,UInt32)]
         if T==String
-            readbytes!(s, b, read(s, UInt32))
-            props[propname] = String(b)
-            empty!(b)
+            props[propname] = String(read(s, read(s, UInt32)))
         else
             propval=read(s,T)
             props[propname]=propval
@@ -205,12 +201,20 @@ function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::I
     isempty(chans) && return nothing
     left = Int(nbytes)
     if interleaved
+        # Whole rows only, read in blocks of at most 16 MiB and split per channel.
         rowbytes = sum(sizeof(eltype(c.data)) for c in chans)
-        while left >= rowbytes
+        rows = left ÷ rowbytes
+        buf = Vector{UInt8}(undef, min(rows, max(1, (1 << 24) ÷ rowbytes)) * rowbytes)
+        done = 0
+        while done < rows
+            k = min(rows - done, length(buf) ÷ rowbytes)
+            read!(s, view(buf, 1:k*rowbytes))
+            off = 0
             for c in chans
-                push!(c.data, read(s, eltype(c.data)))
+                deinterleave!(c.data, buf, off, rowbytes, k)
+                off += sizeof(eltype(c.data))
             end
-            left -= rowbytes
+            done += k
         end
     else
         while left > 0
@@ -223,6 +227,16 @@ function readrawdata!(objdict::ObjDict, nbytes::Integer, interleaved::Bool, s::I
         end
     end
     return nothing
+end
+
+"Append `k` values of `T` to `v`, `stride` bytes apart in `buf` from byte offset `off`."
+function deinterleave!(v::Vector{T}, buf::Vector{UInt8}, off::Int, stride::Int, k::Int) where {T}
+    m = length(v)
+    resize!(v, m + k)
+    GC.@preserve buf for i in 0:k-1
+        @inbounds v[m + 1 + i] = unsafe_load(Ptr{T}(pointer(buf, off + i * stride + 1)))
+    end
+    v
 end
 
 "Append `n` values of `T` to `v` in one read; returns the bytes consumed."

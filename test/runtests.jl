@@ -136,3 +136,52 @@ let dir=joinpath(@__DIR__, "example_files")
         @test_throws ErrorException TDMSReader.readtdms(TDMSReader._example_DAQmx)
     end
 end
+
+# A minimal TDMS 2.0 writer, after NI's "TDMS File Format Internal Structure": the
+# 28-byte lead-in, meta data (object paths, raw data indexes, string properties),
+# then the raw data. Objects are (path, T, nvalues, props); T === nothing: no raw data.
+tdms_str(s) = vcat(collect(reinterpret(UInt8, [UInt32(ncodeunits(s))])), codeunits(s))
+function tdms_segment(io, objs, raw::AbstractVector{UInt8}; interleaved = false)
+    meta = IOBuffer()
+    write(meta, UInt32(length(objs)))
+    for (path, T, n, props) in objs
+        write(meta, tdms_str(path))
+        T === nothing ? write(meta, 0xFFFFFFFF) : write(meta, UInt32(20), UInt32(2), UInt32(1), UInt64(n))  # Int16
+        write(meta, UInt32(length(props)))
+        for (k, v) in props
+            write(meta, tdms_str(k), UInt32(0x20), tdms_str(v))
+        end
+    end
+    m = take!(meta)
+    toc = UInt32(1 << 1 | 1 << 2) | (isempty(raw) ? UInt32(0) : UInt32(1 << 3)) | (interleaved ? UInt32(1 << 5) : UInt32(0))
+    write(io, b"TDSm", toc, UInt32(4713), UInt64(length(m) + length(raw)), UInt64(length(m)), m, raw)
+end
+
+# Reading should cost about the data it returns: not a boxed value per sample
+# (interleaved rows), and not a 64 KiB buffer per string in the meta data.
+@testset "Reading costs about the data" begin
+    dir = mktempdir()
+    n = 200_000
+    chans = [Int16.(mod.(k .* (1:n), 2001) .- 1000) for k in 1:4]
+    p = joinpath(dir, "interleaved_large.tdms")
+    open(p, "w") do io
+        objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), [("/'G'/'c$k'", Int16, n, []) for k in 1:4]...]
+        tdms_segment(io, objs, reinterpret(UInt8, vec(permutedims(hcat(chans...)))); interleaved = true)
+    end
+    a = TDMSReader.readtdms(p)
+    @test all(a["G", "c$k"].data == chans[k] for k in 1:4)
+    @test @allocated(TDMSReader.readtdms(p)) < 4 * (4n * sizeof(Int16))
+
+    q = joinpath(dir, "segments.tdms")
+    open(q, "w") do io
+        for s in 1:300
+            objs = [("/", nothing, 0, ["name" => "segments"]), ("/'G'", nothing, 0, ["unit" => "V"]),
+                    ("/'G'/'x'", Int16, 10, ["unit_string" => "V"])]
+            tdms_segment(io, objs, reinterpret(UInt8, Int16[10s-9:10s;]))
+        end
+    end
+    b = TDMSReader.readtdms(q)
+    @test b["G", "x"].data == Int16[1:3000;]
+    @test b.props["name"] == "segments" && b["G", "x"].props["unit_string"] == "V"
+    @test @allocated(TDMSReader.readtdms(q)) < 300 * 16 * 1024
+end
