@@ -236,6 +236,7 @@ function deinterleave!(v::Vector{T}, buf::Vector{UInt8}, off::Int, stride::Int, 
     GC.@preserve buf for i in 0:k-1
         @inbounds v[m + 1 + i] = unsafe_load(Ptr{T}(pointer(buf, off + i * stride + 1)))
     end
+    fixlayout!(view(v, m+1:m+k))
     v
 end
 
@@ -245,6 +246,7 @@ function readchunk!(v::Vector{T}, n::Integer, s::IO) where {T}
     m = length(v)
     resize!(v, m + n)
     read!(s, view(v, m+1:m+n))
+    fixlayout!(view(v, m+1:m+n))
     n*sizeof(T)
 end
 
