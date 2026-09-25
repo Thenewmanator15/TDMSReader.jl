@@ -297,3 +297,41 @@ end
     @test b.props["name"] == "segments" && b["G", "x"].props["unit_string"] == "V"
     @test @allocated(TDMSReader.readtdms(q)) < 300 * 16 * 1024
 end
+
+# The same for the streaming functions: readtdms allocates the data once, sized from
+# the meta data; a channel's back-to-back chunks are one run on disk, read at once;
+# and an interleaved channel is gathered through a bounded buffer, not the whole span.
+@testset "Streaming costs about the data" begin
+    dir = mktempdir()
+    nch, per, chunks = 4, 1000, 400
+    vals = [Int16.(mod.(k .* (1:per*chunks), 3001) .- 1500) for k in 1:nch]
+    p = joinpath(dir, "logging.tdms")        # one segment, 400 chunks of 4 channels x 1000 values
+    open(p, "w") do io
+        objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), [("/'G'/'c$k'", Int16, per, []) for k in 1:nch]...]
+        tdms_segment(io, objs, reduce(vcat, [reinterpret(UInt8, vals[k][(j-1)*per+1:j*per]) for j in 1:chunks for k in 1:nch]))
+    end
+    @test all(tdmsread(p, "G", "c$k", 1:per*chunks) == vals[k] for k in 1:nch)
+    f = readtdms(p)
+    @test all(f["G", "c$k"].data == vals[k] for k in 1:nch)
+    @test @allocated(readtdms(p)) < 1.5 * TDMSReader.databytes(tdmsinfo(p)) + (1 << 20)
+
+    q = joinpath(dir, "one_channel.tdms")    # one channel in 400 chunks, back to back on disk
+    open(q, "w") do io
+        tdms_segment(io, [("/", nothing, 0, []), ("/'G'", nothing, 0, []), ("/'G'/'x'", Int16, per, [])], reinterpret(UInt8, vals[1]))
+    end
+    @test length(tdmsinfo(q)["G", "x"].runs) == 1
+    @test tdmsread(q, "G", "x", 1:per*chunks) == vals[1]
+    @test tdmsread(q, "G", "x", 999:1002) == vals[1][999:1002]
+
+    n = 1_000_000                            # four Int16 channels, sample-interleaved
+    chans = [Int16.(mod.(k .* (1:n), 2001) .- 1000) for k in 1:4]
+    r = joinpath(dir, "interleaved.tdms")
+    open(r, "w") do io
+        objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), [("/'G'/'c$k'", Int16, n, []) for k in 1:4]...]
+        tdms_segment(io, objs, reinterpret(UInt8, vec(permutedims(hcat(chans...)))); interleaved = true)
+    end
+    info = tdmsinfo(r)
+    @test tdmsread(info, "G", "c3", 1:n) == chans[3]
+    @test tdmsread(info, "G", "c3", 70_000:70_010) == chans[3][70_000:70_010]
+    @test @allocated(tdmsread(info, "G", "c3", 1:n)) < 2 * n * sizeof(Int16)
+end

@@ -22,18 +22,22 @@ databytes(info::TDMSInfo) = sum((ci.eltype === Nothing ? 0 : ci.nsamples * sizeo
     readtdms(fn; memory = Sys.free_memory()) -> File
 
 Read the whole file into memory. `memory` is the byte budget the channel data
-may occupy. It is checked segment by segment, before each segment's data is
-read, so a file that would exceed it is refused -- with a pointer to
-`tdmsblocks` / `tdmsread`, which read on demand -- at the point it would go
-over, never after; there is no separate metadata pass, so the check costs nothing
-on files that fit.
+may occupy. A walk of the meta data alone (`tdmsinfo`) finds how much data the
+file holds before any of it is read, so a file that would exceed the budget is
+refused up front, with a pointer to `tdmsblocks` / `tdmsread`, which read on
+demand. The same walk sizes every channel, so the data is allocated once rather
+than grown chunk by chunk.
 """
 function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
+    info = tdmsinfo(fn)
+    need = databytes(info)
+    need > memory && error("readtdms: $(repr(basename(fn))) holds $need bytes of channel data, more than " *
+                           "memory=$memory; read it on demand with tdmsblocks or tdmsread instead")
+    sizes = Dict("/'$g'/'$c'" => ci.nsamples for ((g, c), ci) in info.channels)
     s = open(fn)
     f=File()
     objdict=ObjDict()
     fsize = filesize(fn)
-    loaded = 0
     while !eof(s)
         startpos = position(s)
         (toc,nextsegmentoffset,rawdataoffset)=readleadin(s)
@@ -42,6 +46,9 @@ function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
         end
         if toc.kTocMetaData
             readmetadata!(f, objdict, s)
+            for (path, c) in objdict.current
+                isempty(c.data) && sizehint!(c.data, get(sizes, path, 0))
+            end
         end
         # A file that was never closed (LabVIEW crashed, power failed) carries an
         # all-ones next-segment offset: its data runs to end of file, and the last
@@ -49,17 +56,11 @@ function readtdms(fn::AbstractString; memory::Integer = Int(Sys.free_memory()))
         datapos = startpos + 28 + Int64(rawdataoffset)
         segend = nextsegmentoffset == typemax(UInt64) ? fsize : min(fsize, startpos + 28 + Int64(nextsegmentoffset))
         if toc.kTocRawData
-            loaded += segend - datapos
-            if loaded > memory
-                close(s)
-                error("readtdms: $(repr(basename(fn))) holds more than $memory bytes of channel data " *
-                      "(memory=; $loaded bytes by byte $datapos); read it on demand with tdmsblocks or tdmsread instead")
-            end
-            seek(s, datapos)
+            moveto!(s, datapos)
             readrawdata!(objdict, segend - datapos, toc.kTocInterleavedData, s)
         end
         nextsegmentoffset == typemax(UInt64) && break
-        seek(s, segend)
+        moveto!(s, segend)
     end
     close(s)
     f
@@ -95,7 +96,7 @@ function tdmsinfo(fn::AbstractString)
             locateruns!(runs, objdict, datapos, segend - datapos, toc.kTocInterleavedData)
         end
         nextsegmentoffset == typemax(UInt64) && break
-        seek(s, segend)
+        moveto!(s, segend)
     end
     close(s)
     channels = OrderedDict{Tuple{String,String},ChannelInfo}()
@@ -111,33 +112,47 @@ end
 Record where the values of the current segment's channels sit, chunk after chunk,
 by the same rules `readrawdata!` reads them: contiguous layout gives each channel
 one run per chunk; interleaved layout gives each channel one strided run over the
-whole rows the segment holds. A partial final chunk yields whole values only.
+whole rows the segment holds. A partial final chunk yields whole values only. A
+run that continues the channel's previous one on disk (one channel written in
+many chunks) extends it, so it is read in one piece.
 """
 function locateruns!(runs, objdict::ObjDict, datapos::Integer, nbytes::Integer, interleaved::Bool)
-    chans = collect(objdict.current)
+    # each channel's run list, element size and chunk length, looked up once per segment
+    chans = [(get!(() -> Run[], runs, path), sizeof(eltype(c.data)), Int(c.nsamples)) for (path, c) in objdict.current]
     isempty(chans) && return
     if interleaved
-        rowbytes = sum(sizeof(eltype(c.data)) for (_, c) in chans)
+        rowbytes = sum(esz for (_, esz, _) in chans)
         rows = nbytes ÷ rowbytes
         off = 0
-        for (path, c) in chans
-            rows > 0 && push!(get!(runs, path, Run[]), Run(datapos + off, rows, rowbytes))
-            off += sizeof(eltype(c.data))
+        for (v, esz, _) in chans
+            rows > 0 && addrun!(v, Run(datapos + off, rows, rowbytes))
+            off += esz
         end
     else
         left = Int(nbytes); at = Int(datapos)
         while left > 0
             before = left
-            for (path, c) in chans
-                esz = sizeof(eltype(c.data))
-                n = min(Int(c.nsamples), left ÷ esz)
-                n > 0 && push!(get!(runs, path, Run[]), Run(at, n, esz))
+            for (v, esz, nsamples) in chans
+                n = min(nsamples, left ÷ esz)
+                n > 0 && addrun!(v, Run(at, n, esz))
                 at += n * esz; left -= n * esz
                 left > 0 || break
             end
             left < before || break        # only a fragment of a value remains
         end
     end
+end
+
+"Append `r` to `v`, or extend the last run if `r` carries on from it on disk."
+function addrun!(v::Vector{Run}, r::Run)
+    if !isempty(v)
+        last = v[end]
+        if last.stride == r.stride && last.offset + last.nvalues * last.stride == r.offset
+            v[end] = Run(last.offset, last.nvalues + r.nvalues, last.stride)
+            return v
+        end
+    end
+    push!(v, r)
 end
 
 """
@@ -192,19 +207,34 @@ function tdmsblocks(f::Function, x::Union{AbstractString,TDMSInfo}, group, chann
     ci.nsamples
 end
 
+"""
+Move `s` to byte `pos`. Forward moves use `skip`, which keeps an `IOStream`'s buffer
+when `pos` is already inside it; `seek` always discards and refills it, which made
+walking 20,000 small segments seven times slower.
+"""
+moveto!(s::IO, pos::Integer) = (d = pos - position(s)) >= 0 ? skip(s, d) : seek(s, pos)
+
 "Fill `out[at:at+n-1]` with samples `first:first+n-1` (1-based) of the channel."
 function readrange!(out::AbstractVector{T}, at::Integer, s::IO, ci::ChannelInfo, first::Integer, n::Integer) where {T}
     k = searchsortedlast(ci.starts, first)
     while n > 0 && k <= length(ci.runs)
         run = ci.runs[k]; skip = first - ci.starts[k]
         take = min(n, run.nvalues - skip)
-        seek(s, run.offset + skip * run.stride)
+        moveto!(s, run.offset + skip * run.stride)
         if run.stride == sizeof(T)
             read!(s, view(out, at:at + take - 1))
-        else                                       # interleaved: one value per row
-            raw = read(s, (take - 1) * run.stride + sizeof(T))
-            GC.@preserve raw for i in 0:take - 1
-                out[at + i] = unsafe_load(Ptr{T}(pointer(raw, i * run.stride + 1)))
+        else                                       # interleaved: one value per row, 2^16 rows at a time
+            rows = min(take, 1 << 16)
+            raw = Vector{UInt8}(undef, (rows - 1) * run.stride + sizeof(T))
+            done = 0
+            while done < take
+                k = min(rows, take - done)
+                done > 0 && moveto!(s, run.offset + (skip + done) * run.stride)
+                read!(s, view(raw, 1:(k - 1) * run.stride + sizeof(T)))
+                GC.@preserve raw for i in 0:k - 1
+                    @inbounds out[at + done + i] = unsafe_load(Ptr{T}(pointer(raw, i * run.stride + 1)))
+                end
+                done += k
             end
         end
         first += take; at += take; n -= take; k += 1
