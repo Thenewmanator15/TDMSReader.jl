@@ -228,15 +228,16 @@ function readrange!(out::AbstractVector{T}, at::Integer, s::IO, ci::ChannelInfo,
             raw = Vector{UInt8}(undef, (rows - 1) * run.stride + sizeof(T))
             done = 0
             while done < take
-                k = min(rows, take - done)
+                m = min(rows, take - done)
                 done > 0 && moveto!(s, run.offset + (skip + done) * run.stride)
-                read!(s, view(raw, 1:(k - 1) * run.stride + sizeof(T)))
-                GC.@preserve raw for i in 0:k - 1
+                read!(s, view(raw, 1:(m - 1) * run.stride + sizeof(T)))
+                GC.@preserve raw for i in 0:m - 1
                     @inbounds out[at + done + i] = unsafe_load(Ptr{T}(pointer(raw, i * run.stride + 1)))
                 end
-                done += k
+                done += m
             end
         end
+        fixlayout!(view(out, at:at + take - 1))
         first += take; at += take; n -= take; k += 1
     end
     out

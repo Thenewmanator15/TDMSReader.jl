@@ -361,3 +361,77 @@ tdms_bytes(x::Int16) = collect(reinterpret(UInt8, [x]))
     f = TDMSReader.readtdms(q)
     @test f["G", "t"].data == ts && f["G", "x"].data == xs
 end
+
+# ... and so must tdmsread and tdmsblocks, which copy runs of bytes the same way.
+@testset "TimeStamp channels, on demand" begin
+    dir = mktempdir()
+    ts = [TDMSReader.TimeStamp(3744278548 + k, UInt64(k) << 60) for k in 0:9]
+    xs = Int16[1:10;]
+    p = joinpath(dir, "timestamps.tdms")
+    open(p, "w") do io
+        tdms_segment(io, [("/", nothing, 0, []), ("/'G'", nothing, 0, []), ("/'G'/'t'", TDMSReader.TimeStamp, 10, [])],
+                     reduce(vcat, tdms_bytes.(ts)))
+    end
+    q = joinpath(dir, "timestamps_interleaved.tdms")
+    open(q, "w") do io
+        objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), ("/'G'/'t'", TDMSReader.TimeStamp, 10, []), ("/'G'/'x'", Int16, 10, [])]
+        tdms_segment(io, objs, reduce(vcat, [vcat(tdms_bytes(t), tdms_bytes(x)) for (t, x) in zip(ts, xs)]); interleaved = true)
+    end
+    for path in (p, q)
+        @test tdmsread(path, "G", "t", 1:10) == ts
+        @test tdmsread(path, "G", "t", 4:6) == ts[4:6]
+        got = TDMSReader.TimeStamp[]
+        tdmsblocks((x, _) -> append!(got, x), path, "G", "t"; blocksize = 3)
+        @test got == ts
+    end
+end
+
+# A range that spans several interleaved segments, each a strided run of its own.
+@testset "interleaved runs across segments" begin
+    p = joinpath(mktempdir(), "interleaved_segments.tdms")
+    a, b = Int16[1:30;], Int16[-30:-1;]
+    open(p, "w") do io
+        objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), ("/'G'/'a'", Int16, 10, []), ("/'G'/'b'", Int16, 10, [])]
+        for s in 0:2
+            rows = [x for i in 1:10 for x in (a[10s+i], b[10s+i])]
+            tdms_segment(io, objs, collect(reinterpret(UInt8, rows)); interleaved = true)
+        end
+    end
+    @test tdmsread(p, "G", "b", 1:30) == b
+    @test tdmsread(p, "G", "a", 5:25) == a[5:25]
+    got = Int16[]; tdmsblocks((x, _) -> append!(got, x), p, "G", "a"; blocksize = 7)
+    @test got == a
+end
+
+# Every combination of layout -- contiguous or interleaved; 1-3 segments, channels and
+# chunks per segment; 1, 2 or 5 values per chunk -- written from values the test knows,
+# then read back by readtdms, by tdmsread over several ranges, and by tdmsblocks at
+# several block sizes. Runs split, merge and cross segments in every way these allow.
+@testset "every small layout reads back as written" begin
+    dir = mktempdir()
+    for interleaved in (false, true), nseg in 1:3, nch in 1:3, chunks in 1:3, per in (1, 2, 5)
+        want = [Int16[] for _ in 1:nch]
+        p = joinpath(dir, "layout.tdms")
+        open(p, "w") do io
+            objs = [("/", nothing, 0, []), ("/'G'", nothing, 0, []), [("/'G'/'c$k'", Int16, per, []) for k in 1:nch]...]
+            for _ in 1:nseg
+                seg = [Int16[100k + length(want[k]) + i for i in 1:per*chunks] for k in 1:nch]
+                raw = interleaved ? [seg[k][i] for i in 1:per*chunks for k in 1:nch] :
+                                    [seg[k][(j-1)*per+i] for j in 1:chunks for k in 1:nch for i in 1:per]
+                tdms_segment(io, objs, collect(reinterpret(UInt8, raw)); interleaved)
+                foreach(k -> append!(want[k], seg[k]), 1:nch)
+            end
+        end
+        info = tdmsinfo(p); f = readtdms(p); n = length(want[1])
+        ok = all(1:nch) do k
+            c = "c$k"
+            f["G", c].data == want[k] && info["G", c].nsamples == n &&
+            all(tdmsread(info, "G", c, r) == want[k][r] for r in (1:n, 2:n, 1:n-1, cld(n, 2):cld(n, 2), max(1, n-6):n)) &&
+            all(1:3) do bs
+                got = Int16[]; tdmsblocks((x, _) -> append!(got, x), info, "G", c; blocksize = bs); got == want[k]
+            end
+        end
+        @test ok
+        ok || @info "layout that failed" interleaved nseg nch chunks per
+    end
+end
